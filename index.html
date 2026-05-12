@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#1d4ed8" />
+  <title>Gjøremål</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon-192.png" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    * { -webkit-tap-highlight-color: transparent; }
+    .serif { font-family: 'Cormorant Garamond', 'Georgia', serif; letter-spacing: -0.01em; }
+    @keyframes pulse-red {
+      0%, 100% { background-color: #dc2626; }
+      50% { background-color: #ef4444; }
+    }
+    .pulse-red { animation: pulse-red 1s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const AI_PROMPT = "You are a task extraction assistant. Analyse the provided input (photo, screenshot, or text) and return a JSON array of to-do items.\n\nRULES:\n- Output ONLY a valid JSON array. No markdown code fences, no commentary, no preamble, no trailing text.\n- Each item must have these fields: text (required), due (optional ISO date YYYY-MM-DD, empty string if none).\n- Use double quotes, not single quotes.\n\nFIELD DEFINITIONS:\n- text: The task itself, written as a short imperative (e.g. \"Call dentist\", \"Buy birthday card for mum\", \"Submit timesheet\"). Capitalise the first letter. Keep it under 80 characters.\n- due: Optional ISO date if a deadline is mentioned (\"by Friday\", \"next Tuesday\", \"end of month\"). Resolve relative dates against today. Empty string if no due date is mentioned or implied.\n\nBEHAVIOUR:\n- Each separate task gets its own entry. Don't merge unrelated tasks.\n- Strip filler like \"I need to\", \"Don't forget to\", \"Remember\".\n- If nothing actionable, return [].\n\nEXAMPLE OUTPUT:\n[{\"text\":\"Call dentist\",\"due\":\"\"},{\"text\":\"Submit timesheet\",\"due\":\"2026-05-09\"},{\"text\":\"Buy birthday card for mum\",\"due\":\"\"}]";
+
+    function loadJSON(key, fallback) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+      } catch (e) { return fallback; }
+    }
+
+    function saveJSON(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+    }
+
+    function nextId(list) {
+      const ids = list.map(function(i) { return i.id; });
+      return ids.length ? Math.max.apply(null, ids) + 1 : 1;
+    }
+
+    function formatDue(iso) {
+      if (!iso) return "";
+      try {
+        const d = new Date(iso + "T00:00:00");
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const tomorrow = new Date(today);
+        tomorrow.setDate(today.getDate() + 1);
+        const diffDays = Math.round((d - today) / (1000 * 60 * 60 * 24));
+        if (diffDays === 0) return "Today";
+        if (diffDays === 1) return "Tomorrow";
+        if (diffDays < 0) return Math.abs(diffDays) + "d overdue";
+        if (diffDays < 7) return "In " + diffDays + "d";
+        return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+      } catch (e) { return iso; }
+    }
+
+    function dueColor(iso) {
+      if (!iso) return "";
+      try {
+        const d = new Date(iso + "T00:00:00");
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const diffDays = Math.round((d - today) / (1000 * 60 * 60 * 24));
+        if (diffDays < 0) return "bg-red-100 text-red-800 border border-red-200";
+        if (diffDays === 0) return "bg-amber-100 text-amber-800 border border-amber-200";
+        if (diffDays <= 3) return "bg-yellow-50 text-yellow-800 border border-yellow-200";
+        return "bg-stone-100 text-stone-600 border border-stone-200";
+      } catch (e) { return "bg-stone-100 text-stone-600 border border-stone-200"; }
+    }
+
+    function App() {
+      const [lists, setLists] = useState(function() {
+        const stored = loadJSON("gjoremal-lists", null);
+        if (stored && stored.length > 0) return stored;
+        return [{
+          id: "main",
+          name: "Main",
+          items: [],
+          deletable: false,
+          isMain: true
+        }];
+      });
+      const [activeListId, setActiveListId] = useState(function() {
+        return loadJSON("gjoremal-active-list", "main");
+      });
+      const [showCompleted, setShowCompleted] = useState(function() {
+        return loadJSON("gjoremal-show-completed", false);
+      });
+
+      useEffect(function() { saveJSON("gjoremal-lists", lists); }, [lists]);
+      useEffect(function() { saveJSON("gjoremal-active-list", activeListId); }, [activeListId]);
+      useEffect(function() { saveJSON("gjoremal-show-completed", showCompleted); }, [showCompleted]);
+
+      const activeList = lists.find(function(l) { return l.id === activeListId; }) || lists[0];
+
+      function updateActiveList(updater) {
+        setLists(lists.map(function(l) {
+          if (l.id !== activeListId) return l;
+          const updatedItems = updater(l.items);
+          return Object.assign({}, l, { items: updatedItems });
+        }));
+      }
+
+      const totalActive = activeList
+        ? activeList.items.filter(function(i) { return !i.done; }).length
+        : 0;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-b from-stone-50 via-blue-50 to-stone-100">
+          <div className="max-w-2xl mx-auto p-3 pb-24">
+            <Header totalActive={totalActive} />
+            <MainView
+              lists={lists}
+              setLists={setLists}
+              activeListId={activeListId}
+              setActiveListId={setActiveListId}
+              activeList={activeList}
+              updateActiveList={updateActiveList}
+              showCompleted={showCompleted}
+              setShowCompleted={setShowCompleted}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    function Header(props) {
+      return (
+        <div className="bg-white rounded-2xl shadow-sm p-3 mb-3 border border-stone-200">
+          <div className="flex items-center gap-3">
+            <img src="icon-192.png" alt="" className="w-12 h-12 rounded-xl flex-shrink-0" />
+            <div className="flex-1 min-w-0 flex items-center gap-2">
+              <h1 className="serif text-2xl font-semibold text-stone-900 leading-none">Gjøremål</h1>
+              <div className="bg-blue-50 px-2 py-0.5 rounded-full text-blue-900 font-medium text-xs border border-blue-200 whitespace-nowrap">
+                {props.totalActive} to do
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AIHelper() {
+      const [copied, setCopied] = useState(false);
+      const [open, setOpen] = useState(false);
+
+      function copyPrompt() {
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(AI_PROMPT).then(function() {
+            setCopied(true);
+            setTimeout(function() { setCopied(false); }, 3000);
+          }).catch(function() {});
+        }
+      }
+
+      return (
+        <React.Fragment>
+          <button
+            onClick={function() { setOpen(true); }}
+            className="flex-1 px-2 py-2 rounded-lg bg-stone-100 text-stone-700 font-medium text-sm border border-stone-200"
+          >
+            🤖 AI
+          </button>
+          {open && (
+            <div
+              className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+              onClick={function() { setOpen(false); }}
+            >
+              <div
+                className="bg-white rounded-2xl w-full max-w-2xl p-4 space-y-3"
+                onClick={function(e) { e.stopPropagation(); }}
+              >
+                <div className="flex items-center gap-2">
+                  <div className="w-9 h-9 bg-stone-100 rounded-full flex items-center justify-center text-lg">🤖</div>
+                  <span className="font-medium text-stone-900 text-base">AI Helper</span>
+                </div>
+                <button
+                  onClick={copyPrompt}
+                  className="w-full px-3 py-2.5 rounded-xl bg-stone-700 text-white font-medium text-sm"
+                >
+                  📋 {copied ? "Copied!" : "Copy AI prompt"}
+                </button>
+                <div className="text-xs text-stone-700 leading-relaxed">
+                  <p className="font-medium mb-1">How to use:</p>
+                  <ol className="list-decimal list-inside space-y-0.5 ml-1">
+                    <li>Tap the button above to copy the prompt</li>
+                    <li>Open ChatGPT/Gemini/Claude with your photo, screenshot, or text</li>
+                    <li>Paste the prompt and your input together</li>
+                    <li>Copy the AI's reply</li>
+                    <li>Come back and tap Paste</li>
+                  </ol>
+                </div>
+                <button
+                  onClick={function() { setOpen(false); }}
+                  className="w-full px-3 py-2 rounded-lg bg-gray-100 text-gray-700 font-medium text-sm"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
+        </React.Fragment>
+      );
+    }
+
+    function MainView(props) {
+      const lists = props.lists;
+      const setLists = props.setLists;
+      const activeListId = props.activeListId;
+      const setActiveListId = props.setActiveListId;
+      const activeList = props.activeList;
+      const updateActiveList = props.updateActiveList;
+      const showCompleted = props.showCompleted;
+      const setShowCompleted = props.setShowCompleted;
+
+      const [input, setInput] = useState("");
+      const [importMessage, setImportMessage] = useState("");
+      const [voiceState, setVoiceState] = useState("idle");
+      const [transcript, setTranscript] = useState("");
+      const [longPressItem, setLongPressItem] = useState(null);
+      const [showPaste, setShowPaste] = useState(false);
+      const [pasteText, setPasteText] = useState("");
+      const recognitionRef = useRef(null);
+      const longPressTimerRef = useRef(null);
+      const editDateRef = useRef(null);
+
+      const voiceSupported = typeof window !== "undefined" &&
+        ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
+
+      function addTask(text, due) {
+        const cleaned = (text || "").trim();
+        if (!cleaned) return;
+        updateActiveList(function(items) {
+          return items.concat([{
+            id: nextId(items),
+            text: cleaned,
+            done: false,
+            due: due || "",
+            createdAt: new Date().toISOString()
+          }]);
+        });
+      }
+
+      function submitInput() {
+        if (!input.trim()) return;
+        addTask(input, "");
+        setInput("");
+      }
+
+      function toggleDone(id) {
+        updateActiveList(function(items) {
+          return items.map(function(i) {
+            if (i.id !== id) return i;
+            return Object.assign({}, i, {
+              done: !i.done,
+              completedAt: !i.done ? new Date().toISOString() : null
+            });
+          });
+        });
+      }
+
+      function deleteTask(id) {
+        updateActiveList(function(items) {
+          return items.filter(function(i) { return i.id !== id; });
+        });
+      }
+
+      function setTaskDue(id, due) {
+        updateActiveList(function(items) {
+          return items.map(function(i) {
+            return i.id === id ? Object.assign({}, i, { due: due }) : i;
+          });
+        });
+      }
+
+      function editTaskText(id) {
+        const item = activeList.items.find(function(i) { return i.id === id; });
+        if (!item) return;
+        const newText = prompt("Edit task:", item.text);
+        if (newText === null || !newText.trim()) return;
+        updateActiveList(function(items) {
+          return items.map(function(i) {
+            return i.id === id ? Object.assign({}, i, { text: newText.trim() }) : i;
+          });
+        });
+      }
+
+      function clearCompleted() {
+        const completed = activeList.items.filter(function(i) { return i.done; });
+        if (completed.length === 0) return;
+        if (confirm("Delete " + completed.length + " completed task(s)?")) {
+          updateActiveList(function(items) {
+            return items.filter(function(i) { return !i.done; });
+          });
+        }
+      }
+
+      function createNewList() {
+        const name = prompt("Name of the new list?");
+        if (!name || !name.trim()) return;
+        const newId = "list_" + Date.now();
+        setLists(lists.concat([{
+          id: newId, name: name.trim(), items: [],
+          deletable: true, isMain: false
+        }]));
+        setActiveListId(newId);
+      }
+
+      function renameList(listId) {
+        const target = lists.find(function(l) { return l.id === listId; });
+        if (!target) return;
+        const newName = prompt("New name for this list?", target.name);
+        if (!newName || !newName.trim()) return;
+        setLists(lists.map(function(l) {
+          return l.id === listId ? Object.assign({}, l, { name: newName.trim() }) : l;
+        }));
+      }
+
+      function deleteList(listId) {
+        const target = lists.find(function(l) { return l.id === listId; });
+        if (!target || !target.deletable) return;
+        if (!confirm("Delete the '" + target.name + "' list? Tasks on it will be lost.")) return;
+        const remaining = lists.filter(function(l) { return l.id !== listId; });
+        setLists(remaining);
+        if (activeListId === listId) {
+          setActiveListId(remaining[0].id);
+        }
+      }
+
+      function handleListPillLongPress(listId) {
+        const target = lists.find(function(l) { return l.id === listId; });
+        if (!target) return;
+        if (target.isMain) {
+          renameList(listId);
+          return;
+        }
+        const choice = prompt("Type 'rename' or 'delete' for the '" + target.name + "' list:");
+        if (choice === "rename") renameList(listId);
+        else if (choice === "delete") deleteList(listId);
+      }
+
+      function cancelLongPress() {
+        if (longPressTimerRef.current) {
+          clearTimeout(longPressTimerRef.current);
+          longPressTimerRef.current = null;
+        }
+      }
+
+      function startLongPress(itemId) {
+        longPressTimerRef.current = setTimeout(function() {
+          setLongPressItem(itemId);
+        }, 600);
+      }
+
+      function processImport(rawText) {
+        try {
+          const data = JSON.parse(rawText);
+          const incoming = Array.isArray(data) ? data : data.items;
+          if (!Array.isArray(incoming)) {
+            setImportMessage("Invalid format - expected JSON array");
+            setTimeout(function() { setImportMessage(""); }, 4000);
+            return false;
+          }
+          let added = 0;
+          updateActiveList(function(items) {
+            const list = items.slice();
+            let id = nextId(list);
+            incoming.forEach(function(row) {
+              const text = row.text || row.task || row.name;
+              if (!text || !String(text).trim()) return;
+              list.push({
+                id: id,
+                text: String(text).trim(),
+                done: false,
+                due: row.due || "",
+                createdAt: new Date().toISOString()
+              });
+              id = id + 1;
+              added = added + 1;
+            });
+            return list;
+          });
+          setImportMessage("Imported: " + added + " task" + (added === 1 ? "" : "s"));
+          setTimeout(function() { setImportMessage(""); }, 4000);
+          return true;
+        } catch (err) {
+          setImportMessage("Could not parse - check the JSON is valid");
+          setTimeout(function() { setImportMessage(""); }, 4000);
+          return false;
+        }
+      }
+
+      function handleImport(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+          processImport(e.target.result);
+        };
+        reader.readAsText(file);
+        event.target.value = "";
+      }
+
+      function startVoice() {
+        if (!voiceSupported) return;
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SR();
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = "en-GB";
+        let finalText = "";
+        recognition.onresult = function(event) {
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) {
+              finalText = finalText + " " + event.results[i][0].transcript;
+            }
+          }
+          setTranscript(finalText.trim());
+        };
+        recognition.onerror = function() { setVoiceState("idle"); };
+        recognition.onend = function() {
+          if (finalText.trim()) {
+            setTranscript(finalText.trim());
+            setVoiceState("transcript");
+          } else {
+            setVoiceState("idle");
+          }
+        };
+        recognition.start();
+        recognitionRef.current = recognition;
+        setVoiceState("listening");
+        setTranscript("");
+      }
+
+      function stopVoice() {
+        if (recognitionRef.current) recognitionRef.current.stop();
+      }
+
+      function commitTranscript() {
+        if (!transcript.trim()) {
+          setVoiceState("idle");
+          return;
+        }
+        // Each sentence becomes a task
+        const fragments = transcript.split(/[,.;]|\band\b|\bthen\b/i);
+        fragments.forEach(function(frag) {
+          const t = frag.trim();
+          if (t) addTask(t.charAt(0).toUpperCase() + t.slice(1), "");
+        });
+        setTranscript("");
+        setVoiceState("idle");
+      }
+
+      function cancelTranscript() {
+        setTranscript("");
+        setVoiceState("idle");
+      }
+
+      // Sort: incomplete first (by due date asc, no-due last), then completed
+      const sortedItems = activeList ? activeList.items.slice().sort(function(a, b) {
+        if (a.done !== b.done) return a.done ? 1 : -1;
+        if (!a.done) {
+          // Both incomplete: sort by due date (empty due goes last)
+          if (a.due && !b.due) return -1;
+          if (!a.due && b.due) return 1;
+          if (a.due && b.due) return a.due.localeCompare(b.due);
+          return a.id - b.id;
+        }
+        // Both done: most recently completed first
+        if (a.completedAt && b.completedAt) {
+          return b.completedAt.localeCompare(a.completedAt);
+        }
+        return 0;
+      }) : [];
+
+      const visibleItems = showCompleted
+        ? sortedItems
+        : sortedItems.filter(function(i) { return !i.done; });
+
+      const completedCount = activeList
+        ? activeList.items.filter(function(i) { return i.done; }).length
+        : 0;
+
+      return (
+        <div>
+          <div className="bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden">
+
+            {/* Section: list pills */}
+            <div className="p-3">
+              <div className="flex gap-2 overflow-x-auto">
+                {lists.map(function(l) {
+                  return (
+                    <button
+                      key={l.id}
+                      onClick={function() { setActiveListId(l.id); }}
+                      onContextMenu={function(e) {
+                        e.preventDefault();
+                        handleListPillLongPress(l.id);
+                      }}
+                      onTouchStart={function() {
+                        longPressTimerRef.current = setTimeout(function() {
+                          handleListPillLongPress(l.id);
+                        }, 600);
+                      }}
+                      onTouchEnd={cancelLongPress}
+                      onTouchMove={cancelLongPress}
+                      className={l.id === activeListId
+                        ? "px-3 py-1.5 rounded-lg bg-blue-700 text-white font-medium text-sm whitespace-nowrap flex-shrink-0 flex items-center gap-1.5"
+                        : "px-3 py-1.5 rounded-lg bg-white text-stone-700 border border-stone-200 font-medium text-sm whitespace-nowrap flex-shrink-0 flex items-center gap-1.5"}
+                    >
+                      {l.isMain && <span className={l.id === activeListId ? "text-yellow-300" : "text-stone-400"}>★</span>}
+                      {l.name}
+                    </button>
+                  );
+                })}
+                <button
+                  onClick={createNewList}
+                  className="px-3 py-1.5 rounded-lg bg-white text-stone-400 border-2 border-dashed border-stone-300 font-medium text-sm flex-shrink-0"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            <div className="border-t border-stone-100"></div>
+
+            {/* Section: add */}
+            <div className="p-3">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Add a task..."
+                  value={input}
+                  onChange={function(e) { setInput(e.target.value); }}
+                  onKeyDown={function(e) { if (e.key === "Enter") submitInput(); }}
+                  className="flex-1 px-3 py-2 border border-stone-200 rounded-lg"
+                />
+                <button
+                  onClick={submitInput}
+                  className="px-4 py-2 rounded-lg bg-blue-700 text-white font-medium text-sm"
+                >
+                  Add
+                </button>
+              </div>
+
+              <div className="flex gap-1.5 mt-2">
+                <label className="flex-1 px-2 py-2 rounded-lg bg-blue-50 text-blue-900 font-medium text-sm text-center border border-blue-200">
+                  📥 Import
+                  <input type="file" accept=".json,application/json" onChange={handleImport} style={{display:"none"}} />
+                </label>
+                <button
+                  onClick={function() {
+                    setShowPaste(true);
+                    if (navigator.clipboard && navigator.clipboard.readText) {
+                      navigator.clipboard.readText().then(function(text) {
+                        if (text) setPasteText(text);
+                      }).catch(function() {});
+                    }
+                  }}
+                  className="flex-1 px-2 py-2 rounded-lg bg-stone-100 text-stone-700 font-medium text-sm border border-stone-200"
+                >
+                  📋 Paste
+                </button>
+                {voiceSupported && (
+                  <button
+                    onClick={voiceState === "listening" ? stopVoice : startVoice}
+                    className={voiceState === "listening"
+                      ? "flex-1 px-2 py-2 rounded-lg pulse-red text-white font-medium text-sm"
+                      : "flex-1 px-2 py-2 rounded-lg bg-blue-700 text-white font-medium text-sm"}
+                  >
+                    🎤 {voiceState === "listening" ? "Stop" : "Voice"}
+                  </button>
+                )}
+                <AIHelper />
+              </div>
+
+              {voiceState === "transcript" && (
+                <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded-lg space-y-2">
+                  <div className="text-sm text-blue-900">
+                    <span className="font-medium">Heard:</span> "{transcript}"
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={commitTranscript}
+                      className="flex-1 px-3 py-1.5 rounded-lg bg-blue-700 text-white text-sm font-medium"
+                    >
+                      Add all
+                    </button>
+                    <button
+                      onClick={cancelTranscript}
+                      className="px-3 py-1.5 rounded-lg bg-white text-gray-700 border border-gray-200 text-sm font-medium"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {importMessage && (
+                <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-900">
+                  {importMessage}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-stone-100"></div>
+
+            {/* Section: list */}
+            <div className="p-3">
+              {!activeList || activeList.items.length === 0 ? (
+                <div className="text-center text-gray-500 py-6">
+                  <div className="text-3xl mb-1">📝</div>
+                  <p className="font-medium text-gray-700 text-sm mb-1">{activeList ? activeList.name : "List"} is empty</p>
+                  <p className="text-xs">Add a task above or paste from clipboard</p>
+                </div>
+              ) : (
+                <React.Fragment>
+                  <div className="flex items-center justify-between mb-2 px-1">
+                    <h2 className="text-base font-bold text-gray-800 flex items-center gap-2">
+                      <span className="text-base">📝</span>
+                      {activeList.name}
+                      <span className="text-sm text-gray-400 font-normal">({visibleItems.length})</span>
+                    </h2>
+                    {completedCount > 0 && (
+                      <button
+                        onClick={function() { setShowCompleted(!showCompleted); }}
+                        className="text-xs text-stone-600 underline"
+                      >
+                        {showCompleted ? "Hide done (" + completedCount + ")" : "Show done (" + completedCount + ")"}
+                      </button>
+                    )}
+                  </div>
+
+                  {visibleItems.length === 0 ? (
+                    <div className="text-center text-gray-400 text-sm py-4">
+                      All done! ✨
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {visibleItems.map(function(item) {
+                        return (
+                          <div
+                            key={item.id}
+                            onContextMenu={function(e) {
+                              e.preventDefault();
+                              setLongPressItem(item.id);
+                            }}
+                            onTouchStart={function() { startLongPress(item.id); }}
+                            onTouchEnd={cancelLongPress}
+                            onTouchMove={cancelLongPress}
+                            className={item.done
+                              ? "bg-stone-50 rounded-lg border border-stone-100 p-2.5 flex items-center gap-3 opacity-60"
+                              : "bg-stone-50 rounded-lg border border-stone-100 p-2.5 flex items-center gap-3"}
+                          >
+                            <button
+                              onClick={function() { toggleDone(item.id); }}
+                              className={item.done
+                                ? "flex-shrink-0 w-7 h-7 rounded-full bg-blue-700 border-2 border-blue-700 text-white flex items-center justify-center"
+                                : "flex-shrink-0 w-7 h-7 rounded-full border-2 border-stone-300 flex items-center justify-center"}
+                            >
+                              {item.done && <span>✓</span>}
+                            </button>
+                            <div className="flex-1 min-w-0">
+                              <div className={item.done
+                                ? "text-stone-500 line-through text-sm"
+                                : "text-stone-900 text-sm"}>
+                                {item.text}
+                              </div>
+                              {item.due && !item.done && (
+                                <div className={"inline-block mt-1 px-1.5 py-0.5 rounded text-xs " + dueColor(item.due)}>
+                                  {formatDue(item.due)}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </React.Fragment>
+              )}
+            </div>
+          </div>
+
+          {/* Clear completed (outside the card) */}
+          {completedCount > 0 && (
+            <div className="mt-4 flex justify-center">
+              <button onClick={clearCompleted} className="text-sm text-gray-500 underline">
+                Clear {completedCount} completed task{completedCount === 1 ? "" : "s"}
+              </button>
+            </div>
+          )}
+
+          {/* Paste modal */}
+          {showPaste && (
+            <div
+              className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+              onClick={function() { setShowPaste(false); setPasteText(""); }}
+            >
+              <div
+                className="bg-white rounded-2xl w-full max-w-2xl p-4 space-y-3"
+                onClick={function(e) { e.stopPropagation(); }}
+              >
+                <div className="font-medium text-gray-900">Paste JSON</div>
+                <textarea
+                  value={pasteText}
+                  onChange={function(e) { setPasteText(e.target.value); }}
+                  placeholder='[{"text":"Call dentist","due":""}]'
+                  className="w-full h-40 px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono"
+                />
+                <div className="flex gap-2">
+                  <button
+                    onClick={function() {
+                      const ok = processImport(pasteText);
+                      if (ok) {
+                        setShowPaste(false);
+                        setPasteText("");
+                      }
+                    }}
+                    className="flex-1 px-3 py-2 rounded-lg bg-stone-700 text-white font-medium text-sm"
+                  >
+                    Parse & import
+                  </button>
+                  <button
+                    onClick={function() { setShowPaste(false); setPasteText(""); }}
+                    className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 font-medium text-sm"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Long-press action menu for tasks */}
+          {longPressItem !== null && (function() {
+            const item = activeList.items.find(function(s) { return s.id === longPressItem; });
+            if (!item) return null;
+            return (
+              <div
+                className="fixed inset-0 bg-black/40 flex items-end justify-center z-50"
+                onClick={function() { setLongPressItem(null); }}
+              >
+                <div
+                  className="bg-white rounded-t-2xl w-full max-w-2xl p-4 space-y-2"
+                  onClick={function(e) { e.stopPropagation(); }}
+                >
+                  <div className="text-center font-medium text-stone-900 pb-2 border-b border-stone-100 text-sm">
+                    {item.text}
+                  </div>
+                  <button
+                    onClick={function() {
+                      editTaskText(item.id);
+                      setLongPressItem(null);
+                    }}
+                    className="w-full px-3 py-3 rounded-lg bg-stone-50 text-stone-800 font-medium text-sm flex items-center gap-2"
+                  >
+                    ✏️ Edit text
+                  </button>
+                  <div className="px-3 py-2 rounded-lg bg-blue-50 border border-blue-200">
+                    <div className="text-xs text-blue-900 font-medium mb-1">Due date</div>
+                    <div className="flex gap-2">
+                      <input
+                        type="date"
+                        ref={editDateRef}
+                        defaultValue={item.due || ""}
+                        className="flex-1 px-2 py-1.5 border border-blue-200 rounded text-sm bg-white"
+                      />
+                      <button
+                        onClick={function() {
+                          const v = editDateRef.current ? editDateRef.current.value : "";
+                          setTaskDue(item.id, v);
+                          setLongPressItem(null);
+                        }}
+                        className="px-3 py-1.5 rounded bg-blue-700 text-white text-sm font-medium"
+                      >
+                        Set
+                      </button>
+                      {item.due && (
+                        <button
+                          onClick={function() {
+                            setTaskDue(item.id, "");
+                            setLongPressItem(null);
+                          }}
+                          className="px-3 py-1.5 rounded bg-white border border-stone-200 text-stone-700 text-sm font-medium"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    onClick={function() {
+                      if (confirm("Delete this task?")) {
+                        deleteTask(item.id);
+                      }
+                      setLongPressItem(null);
+                    }}
+                    className="w-full px-3 py-3 rounded-lg bg-red-50 text-red-800 font-medium text-sm flex items-center gap-2"
+                  >
+                    🗑 Delete
+                  </button>
+                  <button
+                    onClick={function() { setLongPressItem(null); }}
+                    className="w-full px-3 py-2 rounded-lg bg-gray-100 text-gray-700 font-medium text-sm"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", function() {
+        navigator.serviceWorker.register("sw.js").catch(function(err) { console.error(err); });
+      });
+    }
+  </script>
+</body>
+</html>
